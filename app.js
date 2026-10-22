@@ -38,8 +38,11 @@ for (const slot of ["A", "B"]) {
   $("vol" + slot).addEventListener("input", () => {
     const value = Number($("vol" + slot).value);
     if (state[slot]) state[slot].volume = value;
-    if (state[slot]?.gainNode) state[slot].gainNode.gain.value = value;
     updateSliderLabels();
+    clearTimeout(state.volumeTimer);
+    state.volumeTimer = setTimeout(() => {
+      if (state.playing) restartPreviewAudio();
+    }, 150);
   });
 }
 $("resetBtn").addEventListener("click", () => {
@@ -142,7 +145,9 @@ async function loadFile(file, slot) {
   if (!file) return;
   stopPlayback();
   setStatus(`${file.name} を読み込んでいます。`);
-  const url = URL.createObjectURL(file);
+  const raw = await file.arrayBuffer();
+  const audioReady = decodePcm(raw.slice(0));
+  const url = URL.createObjectURL(new Blob([raw], { type: file.type || "video/mp4" }));
   const video = document.createElement("video");
   video.className = "clip-video";
   video.playsInline = true;
@@ -179,8 +184,8 @@ async function loadFile(file, slot) {
     in: 0,
     out: video.duration,
     volume: Number($("vol" + slot).value),
-    audioBuffer: null,
-    audioReady: decodeAudio(file),
+    pcm: null,
+    audioReady,
   };
   if (!state[slot].still) still.remove();
   $("mount" + slot).replaceChildren(video);
@@ -394,7 +399,7 @@ async function playRange(dur) {
   ]);
   const ctx = ensureAudioContext();
   await ctx.resume();
-  const startAt = scheduleBufferAudio(dur);
+  const startAt = await scheduleBufferAudio(dur);
   await delay(Math.max(0, (startAt - ctx.currentTime) * 1000));
   await Promise.all([state.A.video.play(), state.B.video.play()]);
   const start = performance.now();
@@ -455,30 +460,45 @@ function stopBufferAudio() {
   state.audioNodes = [];
 }
 
-function scheduleBufferAudio(duration) {
+async function scheduleBufferAudio(duration) {
   stopBufferAudio();
   const ctx = ensureAudioContext();
+  const mix = await mixPcm(duration, ctx.sampleRate, 0);
+  if (!mix) return ctx.currentTime;
   const startAt = ctx.currentTime + 0.05;
-  const nodes = [];
-  for (const slot of ["A", "B"]) {
-    const item = state[slot];
-    if (!item?.audioBuffer || item.volume <= 0) continue;
-    if (!item.gainNode) {
-      item.gainNode = ctx.createGain();
-      item.gainNode.connect(ctx.destination);
-    }
-    item.gainNode.gain.value = item.volume;
-    const src = ctx.createBufferSource();
-    src.buffer = item.audioBuffer;
-    src.connect(item.gainNode);
-    const offset = clamp(item.in, 0, Math.max(0, item.audioBuffer.duration - 0.001));
-    const available = item.audioBuffer.duration - offset;
-    if (available <= 0.001) continue;
-    src.start(startAt, offset, Math.min(duration, available));
-    nodes.push(src);
-  }
-  state.audioNodes = nodes;
+  const src = ctx.createBufferSource();
+  src.buffer = bufferFromMix(ctx, mix);
+  src.connect(ctx.destination);
+  src.start(startAt);
+  state.audioNodes = [src];
+  state.audioStartPerf = performance.now() + 50;
+  state.audioDuration = duration;
   return startAt;
+}
+
+async function restartPreviewAudio() {
+  if (!state.playing || !state.audioStartPerf) return;
+  const elapsed = (performance.now() - state.audioStartPerf) / 1000;
+  const remain = (state.audioDuration || 0) - elapsed;
+  if (remain <= 0.05) return;
+  stopBufferAudio();
+  const ctx = ensureAudioContext();
+  const mix = await mixPcm(remain, ctx.sampleRate, elapsed);
+  if (!mix || !state.playing) return;
+  const src = ctx.createBufferSource();
+  src.buffer = bufferFromMix(ctx, mix);
+  src.connect(ctx.destination);
+  src.start();
+  state.audioNodes = [src];
+  state.audioStartPerf = performance.now();
+  state.audioDuration = remain;
+}
+
+function bufferFromMix(ctx, mix) {
+  const buffer = ctx.createBuffer(2, mix.left.length, mix.sampleRate);
+  buffer.copyToChannel(mix.left, 0);
+  buffer.copyToChannel(mix.right, 1);
+  return buffer;
 }
 
 async function ensureDecoded() {
@@ -487,24 +507,59 @@ async function ensureDecoded() {
     if (!item) continue;
     item.video.muted = true;
     item.volume = Number($("vol" + slot).value);
-    if (item.audioReady) item.audioBuffer = await item.audioReady;
+    if (item.audioReady) item.pcm = await item.audioReady;
   }
 }
 
-async function decodeAudio(file) {
+async function decodePcm(raw) {
   const ctx = new AudioContext();
   try {
-    const audio = await ctx.decodeAudioData(await file.arrayBuffer());
-    const copy = ctx.createBuffer(audio.numberOfChannels, audio.length, audio.sampleRate);
+    const audio = await ctx.decodeAudioData(raw);
+    const channels = [];
     for (let channel = 0; channel < audio.numberOfChannels; channel += 1) {
-      copy.copyToChannel(audio.getChannelData(channel), channel);
+      channels.push(new Float32Array(audio.getChannelData(channel)));
     }
-    return copy;
+    if (!channels.length || !channels[0].length) return null;
+    return { sampleRate: audio.sampleRate, channels };
   } catch {
     return null;
   } finally {
     await ctx.close();
   }
+}
+
+async function mixPcm(duration, sampleRate, skip) {
+  const total = Math.max(1, Math.ceil(duration * sampleRate));
+  const left = new Float32Array(total);
+  const right = new Float32Array(total);
+  let any = false;
+  for (const item of [state.A, state.B]) {
+    const pcm = item?.pcm;
+    if (!pcm || item.volume <= 0) continue;
+    any = true;
+    const ch0 = pcm.channels[0];
+    const ch1 = pcm.channels[Math.min(1, pcm.channels.length - 1)];
+    const origin = (item.in + skip) * pcm.sampleRate;
+    const vol = item.volume;
+    for (let i = 0; i < total; i += 1) {
+      const srcPos = origin + (i * pcm.sampleRate) / sampleRate;
+      const i0 = Math.floor(srcPos);
+      if (i0 < 0 || i0 >= ch0.length) continue;
+      const i1 = Math.min(i0 + 1, ch0.length - 1);
+      const frac = srcPos - i0;
+      left[i] += (ch0[i0] * (1 - frac) + ch0[i1] * frac) * vol;
+      right[i] += (ch1[i0] * (1 - frac) + ch1[i1] * frac) * vol;
+      if (i > 0 && i % 24000 === 0) await delay(0);
+    }
+  }
+  if (!any) return null;
+  for (let i = 0; i < total; i += 1) {
+    if (left[i] > 1) left[i] = 1;
+    else if (left[i] < -1) left[i] = -1;
+    if (right[i] > 1) right[i] = 1;
+    else if (right[i] < -1) right[i] = -1;
+  }
+  return { left, right, sampleRate };
 }
 
 async function pickAudioCodec() {
@@ -525,10 +580,9 @@ async function pickAudioCodec() {
 }
 
 async function collectAudioChunks(duration, config) {
-  const rendered = await renderMix(duration, config.sampleRate);
-  if (!rendered) return [];
-  const left = rendered.getChannelData(0);
-  const right = rendered.numberOfChannels > 1 ? rendered.getChannelData(1) : left;
+  const mix = await mixPcm(duration, config.sampleRate, 0);
+  if (!mix) return [];
+  const { left, right } = mix;
   const chunks = [];
   let encodeError = null;
   const encoder = new AudioEncoder({
@@ -567,37 +621,6 @@ async function collectAudioChunks(duration, config) {
   return chunks;
 }
 
-async function renderMix(duration, sampleRate) {
-  const length = Math.max(1, Math.ceil(duration * sampleRate));
-  const offline = new OfflineAudioContext(2, length, sampleRate);
-  let any = false;
-  for (const item of [state.A, state.B]) {
-    if (!item?.audioBuffer || item.volume <= 0) continue;
-    const sourceBuffer = copyBuffer(offline, item.audioBuffer);
-    const src = offline.createBufferSource();
-    src.buffer = sourceBuffer;
-    const gain = offline.createGain();
-    gain.gain.value = item.volume;
-    src.connect(gain);
-    gain.connect(offline.destination);
-    const offset = clamp(item.in, 0, Math.max(0, sourceBuffer.duration - 0.001));
-    const available = sourceBuffer.duration - offset;
-    if (available <= 0.001) continue;
-    src.start(0, offset, Math.min(duration, available));
-    any = true;
-  }
-  if (!any) return null;
-  return offline.startRendering();
-}
-
-function copyBuffer(ctx, buffer) {
-  const copy = ctx.createBuffer(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
-  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-    copy.copyToChannel(buffer.getChannelData(channel), channel);
-  }
-  return copy;
-}
-
 async function encodeFrames(dur) {
   const width = canvas.width;
   const height = canvas.height;
@@ -605,7 +628,7 @@ async function encodeFrames(dur) {
   if (!config) throw new Error("encoder unsupported");
   await ensureDecoded();
   const audioCodec = await pickAudioCodec();
-  const audible = [state.A, state.B].some((item) => item.audioBuffer && item.volume > 0);
+  const audible = [state.A, state.B].some((item) => item.pcm && item.volume > 0);
   let audioChunks = null;
   if (audioCodec && audible) {
     try {
@@ -647,7 +670,7 @@ async function encodeFrames(dur) {
   ]);
   const audioCtx = ensureAudioContext();
   await audioCtx.resume();
-  const startAt = scheduleBufferAudio(dur);
+  const startAt = await scheduleBufferAudio(dur);
   await delay(Math.max(0, (startAt - audioCtx.currentTime) * 1000));
   let playing = false;
   try {
@@ -739,13 +762,22 @@ function showResult(blob) {
   $("shareBtn").hidden = !canShare;
   video.addEventListener("loadedmetadata", () => {
     const sound = state.exportedAudio
-      ? "音声あり"
+      ? includedAudioLabel()
       : state.audioFailed
         ? "音声は入れられませんでした。映像だけです"
         : "元の動画に音声がありません";
     setStatus(`書き出しました。${video.videoWidth}×${video.videoHeight}、${video.duration.toFixed(1)} 秒、${(blob.size / 1_000_000).toFixed(1)} MB、${sound}。下の動画で確認して保存できます。`);
   }, { once: true });
   setStatus("書き出しました。確認用の動画を準備しています。");
+}
+
+function includedAudioLabel() {
+  const hasA = Boolean(state.A?.pcm) && state.A.volume > 0;
+  const hasB = Boolean(state.B?.pcm) && state.B.volume > 0;
+  if (hasA && hasB) return "メインとゴーストの音声あり";
+  if (hasA) return "メインの音声のみ。ゴーストの音声は読み取れませんでした";
+  if (hasB) return "ゴーストの音声のみ。メインの音声は読み取れませんでした";
+  return "元の動画に音声がありません";
 }
 
 async function shareResult() {
