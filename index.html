@@ -11,7 +11,7 @@
   <header class="top">
     <p class="mark">試作</p>
     <h1>ski-ghostline</h1>
-    <p class="lead">同じ場所から撮った2本の滑走を重ね、1本の動画にします。映像はこの端末の中だけで処理し、サーバーには送りません。音声は入りません。</p>
+    <p class="lead">同じ場所から撮った2本の滑走を重ね、1本の動画にします。映像と音声はこの端末の中だけで処理し、サーバーには送りません。</p>
   </header>
 
   <main>
@@ -66,7 +66,7 @@
 
     <section class="card">
       <h2>3. 位置と濃さを合わせる</h2>
-      <p class="hint">ゲートや木が重なるまで、ゴーストをドラッグして移動します。大きさはスライダーか、2本指で変えます。位置合わせは開始点のコマで行います。</p>
+      <p class="hint">ゲートや木が重なるまで、ゴーストをドラッグして移動します。大きさはスライダーか、2本指で変えます。位置合わせは開始点のコマで行います。音量は、それぞれの動画に入っている音の大きさです。</p>
       <div class="stage-wrap">
         <canvas id="stage" width="1920" height="1080" aria-label="重ね合わせ"></canvas>
       </div>
@@ -76,6 +76,12 @@
         </label>
         <label>ゴーストの濃さ <output id="opacityOut">50%</output>
           <input id="opacity" type="range" min="0.1" max="0.9" step="0.01" value="0.5">
+        </label>
+        <label>メインの音量 <output id="volOutA">100%</output>
+          <input id="volA" type="range" min="0" max="1" step="0.01" value="1">
+        </label>
+        <label>ゴーストの音量 <output id="volOutB">100%</output>
+          <input id="volB" type="range" min="0" max="1" step="0.01" value="1">
         </label>
       </div>
       <div class="rows">

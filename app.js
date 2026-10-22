@@ -34,17 +34,27 @@ $("opacity").addEventListener("input", () => {
   updateSliderLabels();
   drawIfReady();
 });
+for (const slot of ["A", "B"]) {
+  $("vol" + slot).addEventListener("input", () => {
+    const value = Number($("vol" + slot).value);
+    if (state[slot]) state[slot].volume = value;
+    if (state[slot]?.gainNode) state[slot].gainNode.gain.value = value;
+    updateSliderLabels();
+  });
+}
 $("resetBtn").addEventListener("click", () => {
   stopPlayback();
   resetTransform();
   prepareAlign();
 });
 $("previewBtn").addEventListener("click", () => {
+  armAudio();
   primeBoth();
   if (state.playing) stopPlayback();
   else startPreview();
 });
 $("exportBtn").addEventListener("click", () => {
+  armAudio();
   primeBoth();
   exportMp4();
 });
@@ -107,7 +117,6 @@ function primeBoth() {
   for (const slot of ["A", "B"]) {
     const video = state[slot]?.video;
     if (!video) continue;
-    video.muted = true;
     const pending = video.play();
     if (pending) pending.then(() => video.pause()).catch(() => {});
   }
@@ -161,6 +170,7 @@ async function loadFile(file, slot) {
     return;
   }
   if (state[slot]?.url) URL.revokeObjectURL(state[slot].url);
+  releaseAudio(state[slot]);
   state[slot]?.still?.remove();
   state[slot] = {
     video,
@@ -169,6 +179,9 @@ async function loadFile(file, slot) {
     name: file.name,
     in: 0,
     out: video.duration,
+    volume: Number($("vol" + slot).value),
+    audioBuffer: null,
+    audioReady: decodeAudio(file),
   };
   if (!state[slot].still) still.remove();
   $("mount" + slot).replaceChildren(video);
@@ -271,6 +284,8 @@ function resetTransform() {
 function updateSliderLabels() {
   $("scaleOut").textContent = `${Math.round(state.scale * 100)}%`;
   $("opacityOut").textContent = `${Math.round(state.opacity * 100)}%`;
+  $("volOutA").textContent = `${Math.round(Number($("volA").value) * 100)}%`;
+  $("volOutB").textContent = `${Math.round(Number($("volB").value) * 100)}%`;
 }
 
 function drawIfReady() {
@@ -425,18 +440,163 @@ async function exportMp4() {
   }
 }
 
+function releaseAudio(item) {
+  if (!item) return;
+  try { item.sourceNode?.disconnect(); } catch { /* already disconnected */ }
+  try { item.gainNode?.disconnect(); } catch { /* already disconnected */ }
+}
+
+function ensureAudioContext() {
+  if (!state.audioCtx) state.audioCtx = new AudioContext();
+  return state.audioCtx;
+}
+
+function armAudio() {
+  const ctx = ensureAudioContext();
+  ctx.resume();
+  for (const slot of ["A", "B"]) {
+    const item = state[slot];
+    if (!item) continue;
+    item.video.muted = false;
+    item.volume = Number($("vol" + slot).value);
+    if (!item.sourceNode) {
+      item.sourceNode = ctx.createMediaElementSource(item.video);
+      item.gainNode = ctx.createGain();
+      item.sourceNode.connect(item.gainNode);
+      item.gainNode.connect(ctx.destination);
+    }
+    item.gainNode.gain.value = item.volume;
+  }
+}
+
+async function decodeAudio(file) {
+  const ctx = new AudioContext();
+  try {
+    const raw = await file.arrayBuffer();
+    return await ctx.decodeAudioData(raw);
+  } catch {
+    return null;
+  } finally {
+    await ctx.close();
+  }
+}
+
+async function pickAudioCodec() {
+  if (typeof AudioEncoder === "undefined") return null;
+  const candidates = [
+    { codec: "mp4a.40.2", sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 },
+    { codec: "mp4a.40.2", sampleRate: 44100, numberOfChannels: 2, bitrate: 128000 },
+  ];
+  for (const config of candidates) {
+    try {
+      const support = await AudioEncoder.isConfigSupported(config);
+      if (support.supported) return { ...config, ...(support.config || {}) };
+    } catch {
+      // try the next rate
+    }
+  }
+  return null;
+}
+
+async function collectAudioChunks(duration, config) {
+  const mixed = await mixAudio(duration, config.sampleRate);
+  const chunks = [];
+  let encodeError = null;
+  const encoder = new AudioEncoder({
+    output: (chunk, meta) => chunks.push({ chunk, meta }),
+    error: (error) => {
+      encodeError = error;
+    },
+  });
+  encoder.configure(config);
+  const frameSize = 1024;
+  for (let offset = 0; offset < mixed.left.length; offset += frameSize) {
+    const data = new Float32Array(frameSize * 2);
+    data.set(mixed.left.subarray(offset, offset + frameSize));
+    data.set(mixed.right.subarray(offset, offset + frameSize), frameSize);
+    const audioData = new AudioData({
+      format: "f32-planar",
+      sampleRate: config.sampleRate,
+      numberOfFrames: frameSize,
+      numberOfChannels: 2,
+      timestamp: Math.round((offset / config.sampleRate) * 1e6),
+      data,
+    });
+    encoder.encode(audioData);
+    audioData.close();
+    if (encodeError) throw encodeError;
+  }
+  await encoder.flush();
+  if (encodeError) throw encodeError;
+  encoder.close();
+  return chunks;
+}
+
+async function mixAudio(duration, sampleRate) {
+  const total = Math.ceil(duration * sampleRate);
+  const left = new Float32Array(Math.ceil(total / 1024) * 1024);
+  const right = new Float32Array(left.length);
+  for (const item of [state.A, state.B]) {
+    const buf = item?.audioBuffer;
+    if (!buf || item.volume <= 0) continue;
+    const ch0 = buf.getChannelData(0);
+    const ch1 = buf.numberOfChannels > 1 ? buf.getChannelData(1) : ch0;
+    const start = item.in * buf.sampleRate;
+    for (let i = 0; i < total; i += 1) {
+      const srcPos = start + (i * buf.sampleRate) / sampleRate;
+      const i0 = Math.floor(srcPos);
+      if (i0 < 0 || i0 >= ch0.length) continue;
+      const i1 = Math.min(i0 + 1, ch0.length - 1);
+      const frac = srcPos - i0;
+      left[i] += (ch0[i0] * (1 - frac) + ch0[i1] * frac) * item.volume;
+      right[i] += (ch1[i0] * (1 - frac) + ch1[i1] * frac) * item.volume;
+      if (i % 24000 === 0) await delay(0);
+    }
+  }
+  for (let i = 0; i < total; i += 1) {
+    left[i] = clamp(left[i], -1, 1);
+    right[i] = clamp(right[i], -1, 1);
+  }
+  return { left, right };
+}
+
 async function encodeFrames(dur) {
   const width = canvas.width;
   const height = canvas.height;
   const config = await pickCodec(width, height);
   if (!config) throw new Error("encoder unsupported");
+  state.A.audioBuffer = await state.A.audioReady;
+  state.B.audioBuffer = await state.B.audioReady;
+  state.A.volume = Number($("volA").value);
+  state.B.volume = Number($("volB").value);
+  const audioCodec = await pickAudioCodec();
+  const audible = [state.A, state.B].some((item) => item.audioBuffer && item.volume > 0);
+  let audioChunks = null;
+  if (audioCodec && audible) {
+    try {
+      audioChunks = await collectAudioChunks(dur, audioCodec);
+    } catch (error) {
+      console.warn(error);
+      audioChunks = null;
+    }
+  }
+  state.exportedAudio = Boolean(audioChunks?.length);
+  state.audioFailed = audible && !state.exportedAudio;
   const target = new ArrayBufferTarget();
   const muxer = new Muxer({
     target,
     video: { codec: "avc", width, height, frameRate: FPS },
+    audio: audioChunks?.length ? {
+      codec: "aac",
+      numberOfChannels: 2,
+      sampleRate: audioCodec.sampleRate,
+    } : undefined,
     fastStart: "in-memory",
     firstTimestampBehavior: "offset",
   });
+  if (audioChunks?.length) {
+    for (const part of audioChunks) muxer.addAudioChunk(part.chunk, part.meta);
+  }
   let encodeError = null;
   const encoder = new VideoEncoder({
     output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
@@ -539,7 +699,12 @@ function showResult(blob) {
   const canShare = navigator.canShare && navigator.canShare({ files: [file] });
   $("shareBtn").hidden = !canShare;
   video.addEventListener("loadedmetadata", () => {
-    setStatus(`書き出しました。${video.videoWidth}×${video.videoHeight}、${video.duration.toFixed(1)} 秒、${(blob.size / 1_000_000).toFixed(1)} MB。下の動画で確認して保存できます。`);
+    const sound = state.exportedAudio
+      ? "音声あり"
+      : state.audioFailed
+        ? "音声は入れられませんでした。映像だけです"
+        : "元の動画に音声がありません";
+    setStatus(`書き出しました。${video.videoWidth}×${video.videoHeight}、${video.duration.toFixed(1)} 秒、${(blob.size / 1_000_000).toFixed(1)} MB、${sound}。下の動画で確認して保存できます。`);
   }, { once: true });
   setStatus("書き出しました。確認用の動画を準備しています。");
 }
