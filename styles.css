@@ -169,3 +169,27 @@ progress {
 }
 
 .status { min-height: 1.5em; white-space: pre-wrap; }
+
+.lead a { color: var(--ice); }
+
+.manual h2 { margin-top: 4px; }
+.manual h3 { margin: 16px 0 6px; }
+.manual p, .manual li { max-width: 42rem; }
+.manual ol, .manual ul { margin: 8px 0 0; padding-left: 1.3rem; }
+.manual li + li { margin-top: 6px; }
+.note {
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border-left: 4px solid var(--ice);
+  background: #142833;
+  border-radius: 0 10px 10px 0;
+}
+.note strong { color: var(--ink); }
+
+@media print {
+  body { background: #fff; color: #111; }
+  .card, .note { background: #fff; border-color: #ccc; color: #111; }
+  .lead, .hint, h2, h3, p, li, a { color: #111; }
+  .mark, button, .link { display: none; }
+  a { text-decoration: none; }
+}
