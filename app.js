@@ -48,13 +48,11 @@ $("resetBtn").addEventListener("click", () => {
   prepareAlign();
 });
 $("previewBtn").addEventListener("click", () => {
-  armAudio();
   primeBoth();
   if (state.playing) stopPlayback();
   else startPreview();
 });
 $("exportBtn").addEventListener("click", () => {
-  armAudio();
   primeBoth();
   exportMp4();
 });
@@ -117,6 +115,7 @@ function primeBoth() {
   for (const slot of ["A", "B"]) {
     const video = state[slot]?.video;
     if (!video) continue;
+    video.muted = true;
     const pending = video.play();
     if (pending) pending.then(() => video.pause()).catch(() => {});
   }
@@ -383,30 +382,29 @@ function stopPlayback() {
   state.playing = false;
   state.A?.video.pause();
   state.B?.video.pause();
+  stopBufferAudio();
   $("previewBtn").textContent = "プレビュー";
 }
 
 async function playRange(dur) {
+  await ensureDecoded();
   await Promise.all([
     seek(state.A.video, state.A.in),
     seek(state.B.video, state.B.in),
   ]);
-  const start = performance.now();
+  const ctx = ensureAudioContext();
+  await ctx.resume();
+  const startAt = scheduleBufferAudio(dur);
+  await delay(Math.max(0, (startAt - ctx.currentTime) * 1000));
   await Promise.all([state.A.video.play(), state.B.video.play()]);
+  const start = performance.now();
   while (state.playing && performance.now() - start < dur * 1000) {
-    const elapsed = (performance.now() - start) / 1000;
-    correctDrift(state.A, elapsed);
-    correctDrift(state.B, elapsed);
     draw(true);
     await nextFrame();
   }
   state.A.video.pause();
   state.B.video.pause();
-}
-
-function correctDrift(item, elapsed) {
-  const target = item.in + elapsed;
-  if (Math.abs(item.video.currentTime - target) > 0.12) item.video.currentTime = target;
+  stopBufferAudio();
 }
 
 async function exportMp4() {
@@ -442,7 +440,6 @@ async function exportMp4() {
 
 function releaseAudio(item) {
   if (!item) return;
-  try { item.sourceNode?.disconnect(); } catch { /* already disconnected */ }
   try { item.gainNode?.disconnect(); } catch { /* already disconnected */ }
 }
 
@@ -451,29 +448,58 @@ function ensureAudioContext() {
   return state.audioCtx;
 }
 
-function armAudio() {
+function stopBufferAudio() {
+  for (const node of state.audioNodes || []) {
+    try { node.stop(); } catch { /* already stopped */ }
+  }
+  state.audioNodes = [];
+}
+
+function scheduleBufferAudio(duration) {
+  stopBufferAudio();
   const ctx = ensureAudioContext();
-  ctx.resume();
+  const startAt = ctx.currentTime + 0.05;
+  const nodes = [];
   for (const slot of ["A", "B"]) {
     const item = state[slot];
-    if (!item) continue;
-    item.video.muted = false;
-    item.volume = Number($("vol" + slot).value);
-    if (!item.sourceNode) {
-      item.sourceNode = ctx.createMediaElementSource(item.video);
+    if (!item?.audioBuffer || item.volume <= 0) continue;
+    if (!item.gainNode) {
       item.gainNode = ctx.createGain();
-      item.sourceNode.connect(item.gainNode);
       item.gainNode.connect(ctx.destination);
     }
     item.gainNode.gain.value = item.volume;
+    const src = ctx.createBufferSource();
+    src.buffer = item.audioBuffer;
+    src.connect(item.gainNode);
+    const offset = clamp(item.in, 0, Math.max(0, item.audioBuffer.duration - 0.001));
+    const available = item.audioBuffer.duration - offset;
+    if (available <= 0.001) continue;
+    src.start(startAt, offset, Math.min(duration, available));
+    nodes.push(src);
+  }
+  state.audioNodes = nodes;
+  return startAt;
+}
+
+async function ensureDecoded() {
+  for (const slot of ["A", "B"]) {
+    const item = state[slot];
+    if (!item) continue;
+    item.video.muted = true;
+    item.volume = Number($("vol" + slot).value);
+    if (item.audioReady) item.audioBuffer = await item.audioReady;
   }
 }
 
 async function decodeAudio(file) {
   const ctx = new AudioContext();
   try {
-    const raw = await file.arrayBuffer();
-    return await ctx.decodeAudioData(raw);
+    const audio = await ctx.decodeAudioData(await file.arrayBuffer());
+    const copy = ctx.createBuffer(audio.numberOfChannels, audio.length, audio.sampleRate);
+    for (let channel = 0; channel < audio.numberOfChannels; channel += 1) {
+      copy.copyToChannel(audio.getChannelData(channel), channel);
+    }
+    return copy;
   } catch {
     return null;
   } finally {
@@ -499,7 +525,10 @@ async function pickAudioCodec() {
 }
 
 async function collectAudioChunks(duration, config) {
-  const mixed = await mixAudio(duration, config.sampleRate);
+  const rendered = await renderMix(duration, config.sampleRate);
+  if (!rendered) return [];
+  const left = rendered.getChannelData(0);
+  const right = rendered.numberOfChannels > 1 ? rendered.getChannelData(1) : left;
   const chunks = [];
   let encodeError = null;
   const encoder = new AudioEncoder({
@@ -510,19 +539,25 @@ async function collectAudioChunks(duration, config) {
   });
   encoder.configure(config);
   const frameSize = 1024;
-  for (let offset = 0; offset < mixed.left.length; offset += frameSize) {
+  const frameDuration = Math.round((frameSize / config.sampleRate) * 1e6);
+  for (let offset = 0; offset < left.length; offset += frameSize) {
+    const count = Math.min(frameSize, left.length - offset);
     const data = new Float32Array(frameSize * 2);
-    data.set(mixed.left.subarray(offset, offset + frameSize));
-    data.set(mixed.right.subarray(offset, offset + frameSize), frameSize);
+    for (let i = 0; i < count; i += 1) {
+      data[i * 2] = left[offset + i];
+      data[i * 2 + 1] = right[offset + i];
+    }
     const audioData = new AudioData({
-      format: "f32-planar",
+      format: "f32",
       sampleRate: config.sampleRate,
       numberOfFrames: frameSize,
       numberOfChannels: 2,
       timestamp: Math.round((offset / config.sampleRate) * 1e6),
+      duration: frameDuration,
       data,
     });
     encoder.encode(audioData);
+    while (encoder.encodeQueueSize > 4) await delay(5);
     audioData.close();
     if (encodeError) throw encodeError;
   }
@@ -532,32 +567,35 @@ async function collectAudioChunks(duration, config) {
   return chunks;
 }
 
-async function mixAudio(duration, sampleRate) {
-  const total = Math.ceil(duration * sampleRate);
-  const left = new Float32Array(Math.ceil(total / 1024) * 1024);
-  const right = new Float32Array(left.length);
+async function renderMix(duration, sampleRate) {
+  const length = Math.max(1, Math.ceil(duration * sampleRate));
+  const offline = new OfflineAudioContext(2, length, sampleRate);
+  let any = false;
   for (const item of [state.A, state.B]) {
-    const buf = item?.audioBuffer;
-    if (!buf || item.volume <= 0) continue;
-    const ch0 = buf.getChannelData(0);
-    const ch1 = buf.numberOfChannels > 1 ? buf.getChannelData(1) : ch0;
-    const start = item.in * buf.sampleRate;
-    for (let i = 0; i < total; i += 1) {
-      const srcPos = start + (i * buf.sampleRate) / sampleRate;
-      const i0 = Math.floor(srcPos);
-      if (i0 < 0 || i0 >= ch0.length) continue;
-      const i1 = Math.min(i0 + 1, ch0.length - 1);
-      const frac = srcPos - i0;
-      left[i] += (ch0[i0] * (1 - frac) + ch0[i1] * frac) * item.volume;
-      right[i] += (ch1[i0] * (1 - frac) + ch1[i1] * frac) * item.volume;
-      if (i % 24000 === 0) await delay(0);
-    }
+    if (!item?.audioBuffer || item.volume <= 0) continue;
+    const sourceBuffer = copyBuffer(offline, item.audioBuffer);
+    const src = offline.createBufferSource();
+    src.buffer = sourceBuffer;
+    const gain = offline.createGain();
+    gain.gain.value = item.volume;
+    src.connect(gain);
+    gain.connect(offline.destination);
+    const offset = clamp(item.in, 0, Math.max(0, sourceBuffer.duration - 0.001));
+    const available = sourceBuffer.duration - offset;
+    if (available <= 0.001) continue;
+    src.start(0, offset, Math.min(duration, available));
+    any = true;
   }
-  for (let i = 0; i < total; i += 1) {
-    left[i] = clamp(left[i], -1, 1);
-    right[i] = clamp(right[i], -1, 1);
+  if (!any) return null;
+  return offline.startRendering();
+}
+
+function copyBuffer(ctx, buffer) {
+  const copy = ctx.createBuffer(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    copy.copyToChannel(buffer.getChannelData(channel), channel);
   }
-  return { left, right };
+  return copy;
 }
 
 async function encodeFrames(dur) {
@@ -565,10 +603,7 @@ async function encodeFrames(dur) {
   const height = canvas.height;
   const config = await pickCodec(width, height);
   if (!config) throw new Error("encoder unsupported");
-  state.A.audioBuffer = await state.A.audioReady;
-  state.B.audioBuffer = await state.B.audioReady;
-  state.A.volume = Number($("volA").value);
-  state.B.volume = Number($("volB").value);
+  await ensureDecoded();
   const audioCodec = await pickAudioCodec();
   const audible = [state.A, state.B].some((item) => item.audioBuffer && item.volume > 0);
   let audioChunks = null;
@@ -610,6 +645,10 @@ async function encodeFrames(dur) {
     seek(state.A.video, state.A.in),
     seek(state.B.video, state.B.in),
   ]);
+  const audioCtx = ensureAudioContext();
+  await audioCtx.resume();
+  const startAt = scheduleBufferAudio(dur);
+  await delay(Math.max(0, (startAt - audioCtx.currentTime) * 1000));
   let playing = false;
   try {
     await Promise.all([state.A.video.play(), state.B.video.play()]);
@@ -622,6 +661,7 @@ async function encodeFrames(dur) {
     if (state.cancel) {
       state.A.video.pause();
       state.B.video.pause();
+      stopBufferAudio();
       encoder.close();
       return null;
     }
@@ -629,8 +669,6 @@ async function encodeFrames(dur) {
     const elapsed = i / FPS;
     if (playing) {
       while ((performance.now() - clock) / 1000 < elapsed) await nextFrame();
-      correctDrift(state.A, elapsed);
-      correctDrift(state.B, elapsed);
     } else {
       await Promise.all([
         seek(state.A.video, state.A.in + elapsed),
@@ -653,6 +691,7 @@ async function encodeFrames(dur) {
   }
   state.A.video.pause();
   state.B.video.pause();
+  stopBufferAudio();
   await encoder.flush();
   if (encodeError) throw encodeError;
   encoder.close();
