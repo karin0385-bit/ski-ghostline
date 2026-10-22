@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101820">
+  <title>ski-ghostline</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <p class="mark">試作</p>
+    <h1>ski-ghostline</h1>
+    <p class="lead">同じ場所から撮った2本の滑走を重ね、1本の動画にします。映像はこの端末の中だけで処理し、サーバーには送りません。音声は入りません。</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1. 動画を読み込む</h2>
+      <p class="hint">メインが下地、ゴーストが半透明です。圧縮された動画は避け、撮影した元のファイルを選んでください。</p>
+      <div class="load-row">
+        <label class="file">
+          メイン（A）を選ぶ
+          <input id="fileA" type="file" accept="video/mp4,video/*">
+        </label>
+        <label class="file">
+          ゴースト（B）を選ぶ
+          <input id="fileB" type="file" accept="video/mp4,video/*">
+        </label>
+        <button id="sampleBtn" type="button" class="ghost" hidden>サンプルで試す</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>2. 開始と終了を印す</h2>
+      <p class="hint">同じ瞬間（スタートゲートなど）までコマ送りして、両方の開始を押します。雪景色だけが映る終わりは終了で切ります。書き出しは早い方の終了で止まります。</p>
+      <div class="clips">
+        <article class="clip" id="cardA">
+          <h3>メイン（A） <span id="nameA" class="name">未選択</span></h3>
+          <div id="mountA" class="mount"></div>
+          <input id="scrubA" class="scrub" type="range" min="0" max="1" step="0.001" value="0" disabled>
+          <p class="clock" id="clockA">0:00.0</p>
+          <div class="rows">
+            <button id="backA" type="button" disabled>コマ戻し</button>
+            <button id="fwdA" type="button" disabled>コマ送り</button>
+            <button id="markInA" type="button" class="primary" disabled>開始</button>
+            <button id="markOutA" type="button" disabled>終了</button>
+          </div>
+          <p class="marks"><span id="inLabelA">開始 0:00.0</span><span id="outLabelA">終了 —</span></p>
+        </article>
+        <article class="clip" id="cardB">
+          <h3>ゴースト（B） <span id="nameB" class="name">未選択</span></h3>
+          <div id="mountB" class="mount"></div>
+          <input id="scrubB" class="scrub" type="range" min="0" max="1" step="0.001" value="0" disabled>
+          <p class="clock" id="clockB">0:00.0</p>
+          <div class="rows">
+            <button id="backB" type="button" disabled>コマ戻し</button>
+            <button id="fwdB" type="button" disabled>コマ送り</button>
+            <button id="markInB" type="button" class="primary" disabled>開始</button>
+            <button id="markOutB" type="button" disabled>終了</button>
+          </div>
+          <p class="marks"><span id="inLabelB">開始 0:00.0</span><span id="outLabelB">終了 —</span></p>
+        </article>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>3. 位置と濃さを合わせる</h2>
+      <p class="hint">ゲートや木が重なるまで、ゴーストをドラッグして移動します。大きさはスライダーか、2本指で変えます。位置合わせは開始点のコマで行います。</p>
+      <div class="stage-wrap">
+        <canvas id="stage" width="1920" height="1080" aria-label="重ね合わせ"></canvas>
+      </div>
+      <div class="sliders">
+        <label>大きさ <output id="scaleOut">100%</output>
+          <input id="scale" type="range" min="0.25" max="4" step="0.01" value="1">
+        </label>
+        <label>ゴーストの濃さ <output id="opacityOut">50%</output>
+          <input id="opacity" type="range" min="0.1" max="0.9" step="0.01" value="0.5">
+        </label>
+      </div>
+      <div class="rows">
+        <button id="resetBtn" type="button">位置をリセット</button>
+        <button id="previewBtn" type="button" class="primary" disabled>プレビュー</button>
+      </div>
+      <p id="lengthLabel" class="length">2本の動画を読み込むと、書き出す長さが出ます。</p>
+    </section>
+
+    <section class="card">
+      <h2>4. 1080p で書き出す</h2>
+      <p class="hint">長いときは iPad で失敗することがあります。そのときは同じページを Windows の PC（Chrome または Edge）で開いて書き出してください。</p>
+      <div class="rows">
+        <button id="exportBtn" type="button" class="primary" disabled>MP4 を書き出す</button>
+        <button id="cancelBtn" type="button" hidden>中止</button>
+      </div>
+      <progress id="progress" max="1" value="0" hidden></progress>
+      <p id="status" class="status" role="status">動画を選んでください。</p>
+      <div id="resultWrap" class="result" hidden>
+        <video id="resultVideo" controls playsinline></video>
+        <div class="rows">
+          <a id="downloadLink" class="primary link" download="ski-ghostline.mp4">MP4 を保存</a>
+          <button id="shareBtn" type="button" hidden>共有</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
